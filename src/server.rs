@@ -37,6 +37,19 @@ impl<'a> Server<'a> {
             let (number_of_bytes, src_addr) = self.socket.recv_from(&mut buf)?;
             match std::str::from_utf8(&buf[..number_of_bytes]) {
                 Ok(message) => {
+                    // --- Funcționalitate nouă: Test forțat de e-mail ---
+                    if message.trim() == "FORCE_EMAIL_TEST" {
+                        info!("Am primit comanda de testare forțată a e-mailului de la {}", src_addr);
+                        if let Some(alerter) = &self.alerter {
+                            let subject = "Email de Test de la PDScanner";
+                            let body = "Acesta este un e-mail de test generat automat pentru a verifica configurația SMTP.";
+                            alerter.send_alert(subject, body);
+                        } else {
+                            warn!("Testul de e-mail nu a putut fi efectuat: alertele prin e-mail sunt dezactivate în configurație.");
+                        }
+                        continue; // Treci la următoarea iterație
+                    }
+
                     let log_data = parser::parse_fortigate_log(message);
                     if let Some(alert_message) = self.detector.process_log(&log_data) {
                         // Loghează alerta în consolă/syslog
