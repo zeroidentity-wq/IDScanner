@@ -100,3 +100,45 @@ subject = "🚨 Alertă de Securitate: Scanare de Porturi Detectată 🚨"
    ./pdscanner
    ```
 Serverul va porni și va începe să asculte jurnalele de intrare pe adresa UDP configurată.
+
+## Testarea aplicației
+
+Proiectul include un script de testare, `test_scan.sh`, pentru a valida funcționalitatea serverului într-un mediu controlat.
+
+**Important:** Înainte de a rula scriptul, asigurați-vă că `pdscanner` rulează într-un alt terminal.
+
+### Permisiuni
+Mai întâi, acordați permisiuni de execuție scriptului:
+```sh
+chmod +x test_scan.sh
+```
+
+### Opțiuni de testare
+
+#### 1. Testarea forțată a e-mailului
+Aceasta este cea mai rapidă metodă pentru a verifica dacă setările SMTP din `config.toml` sunt corecte și dacă serviciul de e-mail funcționează.
+```sh
+./test_scan.sh --force-email
+```
+Scriptul va trimite o comandă specială serverului pentru a genera un e-mail de test. Verificați consola serverului și inbox-ul destinatarului.
+
+#### 2. Simularea unei scanări rapide
+Simulează un atacator care scanează rapid mai multe porturi.
+```sh
+./test_scan.sh --type fast
+```
+Pentru a testa și trimiterea e-mailului în urma acestei detecții, adăugați flag-ul `--with-email`:
+```sh
+./test_scan.sh --type fast --with-email
+```
+
+#### 3. Simularea unei scanări lente
+Simulează un atacator discret care scanează porturi la un interval de timp mai mare.
+```sh
+./test_scan.sh --type slow
+```
+La fel ca la scanarea rapidă, puteți adăuga `--with-email` pentru a testa și notificarea prin e-mail:
+```sh
+./test_scan.sh --type slow --with-email
+```
+Acest test va dura mai mult, din cauza pauzelor introduse între pachete.
