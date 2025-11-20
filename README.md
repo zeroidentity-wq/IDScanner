@@ -9,45 +9,71 @@ PDScanner este un instrument de securitate bazat pe Rust, conceput pentru a moni
 - **Alerte prin e-mail:** Trimite notificări detaliate prin e-mail prin SMTP atunci când este detectată o scanare.
 - **Configurare flexibilă:** Permite o configurare ușoară printr-un fișier `config.toml`.
 
-## Noțiuni introductive
+## Compilare
 
-### Cerințe preliminare
+### Opțiunea 1: Compilare standard (necesită Rust pe mașina țintă)
 
-- [Rust](https://www.rust-lang.org/tools/install) (versiunea 2021 sau mai recentă)
-
-### Instalare
-
-1. Clonați depozitul:
+1. **Instalați Rust:** Urmați instrucțiunile de pe [rust-lang.org](https://www.rust-lang.org/tools/install).
+2. **Clonați depozitul:**
    ```sh
    git clone <URL_DEPOZIT>
    cd PDScanner
    ```
-
-2. Construiți proiectul:
+3. **Construiți proiectul:**
    ```sh
    cargo build --release
    ```
+   Executabilul se va găsi la `target/release/pdscanner`.
+
+### Opțiunea 2: Compilare statică (creează un executabil portabil)
+
+Această metodă produce un singur executabil care poate fi rulat pe aproape orice distribuție Linux x86_64, fără a necesita instalarea Rust sau a altor dependențe pe mașina țintă.
+
+#### Pași pentru Red Hat 8.6 / CentOS 8:
+
+1. **Instalați Rust:**
+   ```sh
+   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+   source $HOME/.cargo/env
+   ```
+
+2. **Instalați `musl-gcc`:**
+   Acest compilator este necesar pentru a crea un executabil legat static.
+   ```sh
+   sudo dnf install musl-gcc
+   ```
+
+3. **Adăugați ținta `musl` pentru Rust:**
+   ```sh
+   rustup target add x86_64-unknown-linux-musl
+   ```
+
+4. **Clonați depozitul și compilați:**
+   Proiectul este deja configurat să folosească `musl-gcc` pentru această țintă.
+   ```sh
+   git clone <URL_DEPOZIT>
+   cd PDScanner
+   cargo build --release --target x86_64-unknown-linux-musl
+   ```
+
+5. **Localizați executabilul:**
+   Executabilul static și portabil se va găsi la `target/x86_64-unknown-linux-musl/release/pdscanner`.
 
 ## Configurare
 
-Înainte de a rula aplicația, trebuie să configurați setările în fișierul `config.toml`. Acest fișier vă permite să definiți adresa de legare a serverului, pragurile de detecție a scanării și setările serverului SMTP pentru alerte.
+Înainte de a rula aplicația, creați un fișier `config.toml` în același director cu executabilul.
 
-Iată un exemplu de fișier `config.toml`:
-
+Iată un exemplu de conținut:
 ```toml
 # Adresa și portul pe care va asculta serverul UDP
 bind_address = "0.0.0.0:7878"
 
 # --- Configurare Detecție Rapidă ---
-# Numărul de porturi scanate pentru a declanșa o alertă de scanare rapidă
 fast_scan_threshold = 20
-# Fereastra de timp în secunde pentru detecția scanării rapide
 fast_time_window_secs = 60
 
 # --- Configurare Detecție Lentă ---
-# Numărul de porturi scanate pentru a declanșa o alertă de scanare lentă
 slow_scan_threshold = 100
-# Fereastra de timp în secunde pentru detecția scanării lente
 slow_time_window_secs = 86400
 
 # --- Configurare SMTP pentru Alerte Email ---
@@ -62,14 +88,15 @@ to = ["admin1@example.com", "security-team@example.com"]
 subject = "🚨 Alertă de Securitate: Scanare de Porturi Detectată 🚨"
 ```
 
-**Notă:** Asigurați-vă că ați configurat firewall-ul FortiGate (sau altă sursă de jurnal) pentru a trimite jurnalele de trafic la adresa și portul specificate în `bind_address`.
-
 ## Utilizare
 
-Pentru a porni serverul, rulați următoarea comandă din directorul rădăcină al proiectului:
-
-```sh
-cargo run --release
-```
-
-Serverul va porni și va începe să asculte jurnalele de intrare pe adresa UDP configurată. Când este detectată o scanare de porturi, o avertizare va fi înregistrată în consolă, iar o alertă va fi trimisă la adresele de e-mail specificate, dacă alertele prin e-mail sunt activate.
+1. Transferați executabilul `pdscanner` și fișierul `config.toml` pe mașina țintă.
+2. Asigurați-vă că executabilul are permisiuni de execuție:
+   ```sh
+   chmod +x pdscanner
+   ```
+3. Rulați executabilul:
+   ```sh
+   ./pdscanner
+   ```
+Serverul va porni și va începe să asculte jurnalele de intrare pe adresa UDP configurată.
