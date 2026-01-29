@@ -1,0 +1,30 @@
+[Unit]
+Description=Intrusion Detection Scanner for ArcSight
+After=network.target
+
+[Service]
+Type=simple
+User=idsuser
+Group=idsuser
+WorkingDirectory=/opt/ids-scanner
+ExecStart=/opt/ids-scanner/ids-scanner
+Restart=always
+RestartSec=10
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ids-scanner
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/ids-scanner
+
+# Environment
+Environment="RUST_LOG=info"
+
+[Install]
+WantedBy=multi-user.target

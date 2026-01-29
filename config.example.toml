@@ -1,0 +1,34 @@
+# Configurare Intrusion Detection Scanner
+
+[network]
+# Adresa și portul pe care ascultă programul pentru log-uri
+listen_address = "0.0.0.0"
+listen_port = 5555
+
+# Adresa ArcSight SIEM pentru trimiterea alertelor
+siem_address = "127.0.0.1"
+siem_port = 514
+
+[detection]
+# Pragul pentru scan rapid (număr de porturi diferite)
+rapid_scan_threshold = 10
+
+# Fereastra de timp pentru scan rapid (secunde)
+rapid_scan_window = 60
+
+# Pragul pentru scan lent (număr de porturi diferite)
+slow_scan_threshold = 20
+
+# Fereastra de timp pentru scan lent (secunde)
+slow_scan_window = 3600
+
+# Timp de expirare pentru cache (secunde)
+cache_expiry = 7200
+
+[filtering]
+# Filtrare după acțiune (opțional)
+# filter_by_action = true
+# allowed_actions = ["DENY", "BLOCK", "DROP"]
+
+# Lista de IP-uri albe (nu vor genera alerte)
+# whitelist_ips = ["10.0.0.1", "192.168.1.100"]
