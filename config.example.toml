@@ -1,34 +1,55 @@
-# Configurare Intrusion Detection Scanner
+# ============================================================================
+# EXEMPLU DE CONFIGURARE - IDS Scanner
+# ============================================================================
+# Copiază acest fișier ca "config.toml" și modifică valorile după necesități
+#
+# Comandă: cp config.example.toml config.toml
 
 [network]
-# Adresa și portul pe care ascultă programul pentru log-uri
-listen_address = "0.0.0.0"
-listen_port = 5555
+# Adresa pe care ascultă programul pentru log-uri UDP
+listen_address = "0.0.0.0:5555"
 
-# Adresa ArcSight SIEM pentru trimiterea alertelor
-siem_address = "127.0.0.1"
-siem_port = 514
+# Adresa SIEM-ului ArcSight unde trimitem alertele
+siem_address = "127.0.0.1:514"
 
 [detection]
-# Pragul pentru scan rapid (număr de porturi diferite)
-rapid_scan_threshold = 10
+# === SCANARE RAPIDĂ ===
+# Detectează scan-uri agresive (ex: nmap -T4 sau -T5)
+rapid_scan_threshold = 10          # Câte porturi
+rapid_scan_window_sec = 60         # În câte secunde (1 minut)
 
-# Fereastra de timp pentru scan rapid (secunde)
-rapid_scan_window = 60
+# === SCANARE LENTĂ ===
+# Detectează scan-uri stealth (ex: nmap -T1 sau -T2)
+slow_scan_threshold = 20           # Câte porturi
+slow_scan_window_sec = 3600        # În câte secunde (1 oră)
 
-# Pragul pentru scan lent (număr de porturi diferite)
-slow_scan_threshold = 20
+# === CURĂȚARE MEMORIE ===
+# Câte secunde păstrăm informații despre IP-uri în memorie
+cache_expiration_sec = 7200        # 2 ore
 
-# Fereastra de timp pentru scan lent (secunde)
-slow_scan_window = 3600
+# === FILTRARE (opțional) ===
+# Procesează doar anumite acțiuni din log-uri
+# Comentează dacă vrei să procesezi toate log-urile
+# filter_actions = ["deny", "block", "drop"]
 
-# Timp de expirare pentru cache (secunde)
-cache_expiry = 7200
+# ============================================================================
+# EXEMPLE DE CONFIGURĂRI ALTERNATIVE
+# ============================================================================
 
-[filtering]
-# Filtrare după acțiune (opțional)
-# filter_by_action = true
-# allowed_actions = ["DENY", "BLOCK", "DROP"]
+# --- Configurare pentru rețea foarte mare (toleranță mai mare) ---
+# rapid_scan_threshold = 20
+# rapid_scan_window_sec = 120
+# slow_scan_threshold = 50
+# slow_scan_window_sec = 7200
 
-# Lista de IP-uri albe (nu vor genera alerte)
-# whitelist_ips = ["10.0.0.1", "192.168.1.100"]
+# --- Configurare pentru securitate maximă (detectare foarte sensibilă) ---
+# rapid_scan_threshold = 5
+# rapid_scan_window_sec = 30
+# slow_scan_threshold = 10
+# slow_scan_window_sec = 1800
+
+# --- Configurare pentru testing ---
+# rapid_scan_threshold = 3
+# rapid_scan_window_sec = 30
+# slow_scan_threshold = 5
+# slow_scan_window_sec = 300
