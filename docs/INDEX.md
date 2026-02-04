@@ -21,7 +21,7 @@ Dacă ești **începător în Rust** și vrei să înveți:
    - Resurse de învățare
    - Exerciții practice
 
-2. **[src/main_educational_ro.rs](../src/main_educational_ro.rs)** - Cod cu comentarii educaționale
+2. **[src/main_educational_ro.rs](../src/edu.rs)** - Cod cu comentarii educaționale
    - Fiecare linie explicată în română
    - Explicații despre conceptele Rust folosite
    - Exemple și sfaturi
@@ -130,7 +130,7 @@ ids-scanner/
 
 - **Pornesc rapid scanner-ul** → [QUICKSTART.md](QUICKSTART.md)
 - **Învăț Rust de la zero** → [INVATARE_RUST.md](INVATARE_RUST.md)
-- **Înțeleg codul pas cu pas** → [src/main_educational_ro.rs](../src/main_educational_ro.rs)
+- **Înțeleg codul pas cu pas** → [src/main_educational_ro.rs](../src/edu.rs)
 - **Fac modificări practice** → [EXEMPLE_PRACTICE.md](EXEMPLE_PRACTICE.md)
 - **Deployment în producție** → [DEPLOYMENT.md](DEPLOYMENT.md)
 - **Înțeleg ce detectează** → [EXAMPLES.md](EXAMPLES.md) (Secțiunea Scenarii)
