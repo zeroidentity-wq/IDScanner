@@ -57,80 +57,180 @@ cargo build --release
 # Binarul se va afla în target/release/ids-scanner
 ```
 
-## ⚙️ Configurare ArcSight Logger
+## 📊 Configurare ArcSight Forwarder
 
-### Pasul 1: Configurare Forwarder în ArcSight
+### Recomandare: Folosește **CEF Syslog** format
 
-1. Accesează interfața web ArcSight Logger
-2. Navighează la **Configuration → Forwarders**
-3. Click pe **Add Forwarder**
-4. Configurează următoarele:
-   - **Name**: IDS_Scanner_Forwarder
-   - **Destination**: IP-ul serverului unde rulează scanner-ul
-   - **Port**: 5555 (sau portul ales)
-   - **Protocol**: UDP
-   - **Format**: CEF (recomandat) sau Raw Syslog
+În fișierul de configurare ArcSight Forwarder (`agents.properties` sau `forwarding.xml`):
 
-### Pasul 2: Aplicare Filtre (Recomandat)
-
-Pentru a reduce volumul de date și a trimite doar evenimente relevante:
-
-```
-deviceVendor = "Cisco" AND (action = "DENY" OR action = "BLOCK")
+```properties
+# Configurare agent pentru trimitere log-uri către IDS Scanner
+agent[0].mode=CEFSyslog
+agent[0].type=udp
+agent[0].destination.host=127.0.0.1
+agent[0].destination.port=5555
 ```
 
-Sau pentru trafic de firewall:
+**De ce CEF Syslog?**
+- ✅ Structură CEF (src, dst, dpt) - ușor de parsat
+- ✅ Header Syslog cu timestamp și hostname
+- ✅ Cel mai complet format pentru detectare
+- ✅ Compatibil perfect cu parser-ul din cod
 
+### Alternative de formate suportate:
+
+| Format | Avantaje | Dezavantaje |
+|--------|----------|-------------|
+| **CEF Syslog** ⭐ | Complet, structurat | Ușor mai verbose |
+| CEF File | Simplu, structurat | Fără context syslog |
+| Raw Syslog | Flexibil | Nestructurat |
+
+## 📝 Exemple de Log-uri Suportate
+
+### Format CEF Syslog (recomandat):
 ```
-deviceCategory = "Firewall" AND destinationPort > 0
+<134>Jan 15 10:30:45 firewall CEF:0|Vendor|Product|1.0|100|Traffic Denied|5|src=192.168.1.100 dst=10.0.0.50 dpt=22 act=deny proto=TCP
 ```
 
-## 🔧 Utilizare
+### Format CEF simplu:
+```
+CEF:0|Vendor|Product|1.0|100|Traffic Denied|5|src=192.168.1.100 dst=10.0.0.50 dpt=22 act=deny proto=TCP
+```
 
-### Rulare Simplă
+### Format Raw Syslog:
+```
+Jan 15 10:30:45 firewall kernel: SRC=192.168.1.100 DST=10.0.0.50 DPT=22 ACT=deny
+```
+
+## 🧪 Testing
+
+### 1. Test manual cu netcat
 
 ```bash
-# Rulează cu setările default
-./target/release/ids-scanner
+# În terminal 1: Pornește IDS Scanner
+RUST_LOG=info cargo run
+
+# În terminal 2: Trimite log-uri de test
+echo "CEF:0|Test|Test|1.0|100|Test|5|src=192.168.1.100 dst=10.0.0.50 dpt=22 act=deny" | nc -u 127.0.0.1 5555
+echo "CEF:0|Test|Test|1.0|100|Test|5|src=192.168.1.100 dst=10.0.0.50 dpt=23 act=deny" | nc -u 127.0.0.1 5555
+# ... trimite 10+ mesaje cu porturi diferite pentru a declanșa alertă
 ```
 
-### Setări Default
+### 2. Script de test automat
 
-- **Port de ascultare**: 5555 (UDP)
-- **SIEM address**: 127.0.0.1:514 (UDP)
-- **Scan rapid**: 10+ porturi în 60 secunde
-- **Scan lent**: 20+ porturi în 3600 secunde (1 oră)
+```bash
+#!/bin/bash
+# test_scan.sh - Simulează un scan rapid
 
-### Modificare Configurare în Cod
-
-Editează `src/main.rs` pentru a schimba setările:
-
-```rust
-// Modifică portul de ascultare
-let listen_addr = "0.0.0.0:6666";
-
-// Modifică adresa SIEM
-let siem_addr = "10.0.0.50:514";
-
-// Modifică pragurile de detecție
-let config = ScanDetectionConfig {
-    rapid_scan_threshold: 15,      // 15+ porturi
-    rapid_scan_window: 30,         // în 30 secunde
-    slow_scan_threshold: 25,       // 25+ porturi
-    slow_scan_window: 7200,        // în 2 ore
-    cache_expiry: 14400,           // cache de 4 ore
-};
+for port in {22..35}; do
+    echo "CEF:0|Test|Test|1.0|100|Test|5|src=192.168.1.100 dst=10.0.0.50 dpt=$port act=deny" | nc -u 127.0.0.1 5555
+    sleep 0.5
+done
 ```
 
-## 📊 Exemple de Log-uri Acceptate
-
-### Format CEF (Recomandat)
-
-```
-CEF:0|Cisco|ASA|9.0|106023|Deny tcp src|5|src=192.168.1.100 dst=10.0.0.50 dpt=22 proto=TCP act=DENY
+Rulează:
+```bash
+chmod +x test_scan.sh
+./test_scan.sh
 ```
 
-### Format Raw Syslog
+### 3. Verificare alertă
+
+Dacă totul funcționează corect, vei vedea în consolă:
+
+```
+⚠️  SCAN DETECTAT: Scan de rețea RAPID_SCAN detectat: IP 192.168.1.100 a accesat 10 porturi unice în ultimele 60 secunde
+📤 Alertă trimisă către SIEM (127.0.0.1:514): CEF:0|CustomIDS|NetworkScanner|1.0|RAPID_SCAN|...
+```
+
+##  Personalizare Configurare
+
+### Configurare pentru securitate maximă (detectare sensibilă):
+```toml
+rapid_scan_threshold = 5      # 5 porturi
+rapid_scan_window_sec = 30    # în 30 secunde
+slow_scan_threshold = 10      # 10 porturi
+slow_scan_window_sec = 1800   # în 30 minute
+```
+
+### Configurare pentru rețele mari (toleranță mare):
+```toml
+rapid_scan_threshold = 20     # 20 porturi
+rapid_scan_window_sec = 120   # în 2 minute
+slow_scan_threshold = 50      # 50 porturi
+slow_scan_window_sec = 7200   # în 2 ore
+```
+
+### Filtrare doar acțiuni blocate:
+```toml
+filter_actions = ["deny", "block", "drop", "reject"]
+```
+
+## 📂 Structura Proiectului
+
+```
+ids-scanner/
+├── Cargo.toml              # Dependințe Rust
+├── config.toml             # Configurare activă (creat de tine)
+├── config.example.toml     # Template configurare
+├── README.md               # Această documentație
+└── src/
+    └── main.rs             # Codul principal (cu comentarii în română)
+```
+
+## 🐛 Troubleshooting
+
+### Problema: "Nu pot încărca config.toml"
+
+**Soluție:**
+```bash
+# Verifică dacă fișierul există
+ls -l config.toml
+
+# Dacă nu există, creează-l din template
+cp config.example.toml config.toml
+```
+
+Programul va folosi configurarea default dacă `config.toml` lipsește.
+
+### Problema: "Address already in use"
+
+**Soluție:** Portul 5555 este ocupat de alt proces.
+
+```bash
+# Găsește procesul care ocupă portul
+sudo lsof -i :5555
+
+# SAU schimbă portul în config.toml
+listen_address = "0.0.0.0:5556"  # alt port
+```
+
+### Problema: Nu primesc log-uri
+
+**Verificări:**
+1. ArcSight Forwarder trimite către IP:PORT corect?
+2. Firewall-ul blochează UDP 5555?
+3. Rulează IDS Scanner pe aceeași mașină cu Forwarder?
+
+```bash
+# Testează conectivitatea
+echo "test" | nc -u 127.0.0.1 5555
+
+# Verifică dacă programul ascultă
+sudo netstat -tulpn | grep 5555
+```
+
+### Problema: Nu detectează scan-uri
+
+**Verificări:**
+1. Log-urile conțin `src=` și `dpt=`?
+2. Pragurile sunt prea mari? (scade-le în `config.toml`)
+3. Filtrul de acțiuni exclude log-urile? (comentează `filter_actions`)
+
+```bash
+# Activează logging detaliat
+RUST_LOG=debug cargo run
+```
 
 ```
 Jan 29 10:15:30 firewall: src=192.168.1.100 dst=10.0.0.50 dport=80 action=DENY
