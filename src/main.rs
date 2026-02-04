@@ -1,422 +1,819 @@
+// ============================================================================
+// SCANNER DE DETECTARE INTRUZIUNI - Versiune Educațională în Română
+// ============================================================================
+// Acest program detectează scan-uri de rețea (rapid și lent) din log-uri UDP
+// și trimite alerte către ArcSight SIEM
+//
+// VERSIUNE 2.0 - Cu suport pentru configurare din fișier TOML
+// ============================================================================
+
+// SECȚIUNEA 1: IMPORT-URI (Ce biblioteci folosim)
+// ============================================================================
+// anyhow - Pentru gestionarea erorilor într-un mod simplu
 use anyhow::Result;
+
+// chrono - Pentru lucrul cu date și timp
 use chrono::{DateTime, Utc};
+
+// config - Pentru citirea fișierelor de configurare TOML
+use config::Config;
+
+// dashmap - HashMap thread-safe (poate fi accesat din mai multe thread-uri simultan)
+// Este ca un HashMap normal, dar sigur pentru programare concurentă
 use dashmap::DashMap;
+
+// log - Pentru a afișa mesaje de logging (info, warning, error)
 use log::{error, info, warn};
+
+// regex - Pentru a căuta pattern-uri în text (expresii regulate)
 use regex::Regex;
+
+// serde - Pentru serializare/deserializare (convertire între struct-uri și JSON/text)
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::net::UdpSocket;
-use tokio::time;
 
-/// Configurare pentru detectarea scan-urilor
-#[derive(Debug, Clone)]
-struct ScanDetectionConfig {
-    /// Numărul minim de porturi diferite scanate pentru a declansa alertă (scan rapid)
-    rapid_scan_threshold: usize,
-    /// Interval de timp pentru scan rapid (în secunde)
-    rapid_scan_window: u64,
-    /// Numărul minim de porturi pentru scan lent
-    slow_scan_threshold: usize,
-    /// Interval de timp pentru scan lent (în secunde)
-    slow_scan_window: u64,
-    /// Timpul de expirare pentru intrările în cache (în secunde)
-    cache_expiry: u64,
+// std - Bibliotecă standard Rust
+use std::net::SocketAddr;           // Pentru adrese de rețea
+use std::sync::Arc;                 // Arc = Atomic Reference Counted (pointer thread-safe)
+use std::time::{Duration, SystemTime, UNIX_EPOCH}; // Pentru măsurarea timpului
+
+// tokio - Framework async pentru Rust (permite rularea de cod concurrent eficient)
+use tokio::net::UdpSocket;          // Socket UDP asincron
+use tokio::time;                    // Utilități pentru timp asincron
+
+// ============================================================================
+// SECȚIUNEA 2: CONFIGURARE DETECTARE SCAN-URI
+// ============================================================================
+
+/// STRUCT = o structură de date (ca un class în alte limbaje)
+/// Aceasta stochează setările pentru detectarea scan-urilor
+///
+/// #[derive(Debug, Clone, Deserialize, Serialize)] înseamnă:
+/// - Debug: Poți să afișezi struct-ul cu {:?}
+/// - Clone: Poți să faci o copie a struct-ului
+/// - Deserialize: Poate fi creat din TOML/JSON
+/// - Serialize: Poate fi convertit în TOML/JSON
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct ConfigurareDetecareScanuri {
+    /// Câmpurile struct-ului (datele pe care le păstrează)
+
+    /// Câte porturi diferite trebuie scanate rapid pentru alertă
+    /// usize = unsigned size (număr întreg pozitiv, dimensiunea variază după sistem)
+    prag_scanare_rapida: usize,
+
+    /// Câte secunde definește "rapid" (fereastra de timp)
+    /// u64 = unsigned 64-bit integer (număr întreg pozitiv mare)
+    fereastra_scanare_rapida: u64,
+
+    /// Câte porturi pentru scan lent
+    prag_scanare_lenta: usize,
+
+    /// Câte secunde pentru scan lent (ex: 1 oră = 3600 secunde)
+    fereastra_scanare_lenta: u64,
+
+    /// După cât timp să ștergem datele vechi din memorie
+    expirare_cache: u64,
+
+    /// Opțional: filtrează doar anumite acțiuni (ex: ["deny", "block"])
+    #[serde(default)]
+    filter_actions: Option<Vec<String>>,
 }
 
-impl Default for ScanDetectionConfig {
-    fn default() -> Self {
-        Self {
-            rapid_scan_threshold: 10,      // 10+ porturi în interval scurt = scan rapid
-            rapid_scan_window: 60,         // 1 minut
-            slow_scan_threshold: 20,       // 20+ porturi în interval lung = scan lent
-            slow_scan_window: 3600,        // 1 oră
-            cache_expiry: 7200,            // 2 ore
-        }
-    }
-}
+// IMPL = implementation (implementare)
+// Aici definim funcții (metode) pentru struct-ul nostru
+impl ConfigurareDetecareScanuri {
+    /// Încarcă configurarea din fișierul TOML
+    ///
+    /// Parametri:
+    /// cale: &str - calea către fișierul de configurare (ex: "config")
+    ///
+    /// Returnează:
+    /// Result<Self> - Ok(configurare) sau Err(eroare)
+    fn din_fisier(cale: &str) -> Result<Self> {
+        info!("📂 Încerc să încarc configurarea din {}.toml", cale);
 
-/// Informații despre activitatea unui IP sursă
-#[derive(Debug, Clone)]
-struct SourceActivity {
-    /// Lista de porturi scanate cu timestamp-uri
-    port_accesses: Vec<(u16, u64)>,
-    /// Ultimul timestamp de activitate
-    last_seen: u64,
-    /// Flag dacă a fost deja raportată o alertă recentă
-    alert_sent: bool,
-}
+        // Construiește configurarea din fișier
+        let settings = Config::builder()
+            .add_source(config::File::with_name(cale))
+            .build()?;
 
-impl SourceActivity {
-    fn new() -> Self {
-        Self {
-            port_accesses: Vec::new(),
-            last_seen: current_timestamp(),
-            alert_sent: false,
-        }
-    }
-
-    /// Adaugă un nou port accesat
-    fn add_port(&mut self, port: u16) {
-        let now = current_timestamp();
-        self.port_accesses.push((port, now));
-        self.last_seen = now;
-    }
-
-    /// Curăță intrările vechi bazat pe fereastra de timp
-    fn cleanup(&mut self, window: u64) {
-        let cutoff = current_timestamp().saturating_sub(window);
-        self.port_accesses.retain(|(_, timestamp)| *timestamp > cutoff);
-    }
-
-    /// Numără porturile unice într-o anumită fereastră de timp
-    fn unique_ports_in_window(&self, window: u64) -> usize {
-        let cutoff = current_timestamp().saturating_sub(window);
-        self.port_accesses
-            .iter()
-            .filter(|(_, timestamp)| *timestamp > cutoff)
-            .map(|(port, _)| port)
-            .collect::<std::collections::HashSet<_>>()
-            .len()
-    }
-}
-
-/// Eveniment CEF parsat
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct CefEvent {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    source_ip: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    dest_ip: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    dest_port: Option<u16>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    action: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    protocol: Option<String>,
-    timestamp: String,
-    raw: String,
-}
-
-/// Alertă de scan detectat
-#[derive(Debug, Serialize)]
-struct ScanAlert {
-    alert_type: String,
-    source_ip: String,
-    unique_ports_scanned: usize,
-    time_window_seconds: u64,
-    detection_time: String,
-    severity: String,
-    message: String,
-}
-
-impl ScanAlert {
-    fn new(
-        alert_type: String,
-        source_ip: String,
-        unique_ports: usize,
-        window: u64,
-    ) -> Self {
-        let severity = if alert_type == "RAPID_SCAN" {
-            "HIGH"
-        } else {
-            "MEDIUM"
+        // Extrage valorile din secțiunea [detection]
+        let config = Self {
+            prag_scanare_rapida: settings
+                .get("detection.rapid_scan_threshold")
+                .unwrap_or(10),
+            fereastra_scanare_rapida: settings
+                .get("detection.rapid_scan_window_sec")
+                .unwrap_or(60),
+            prag_scanare_lenta: settings
+                .get("detection.slow_scan_threshold")
+                .unwrap_or(20),
+            fereastra_scanare_lenta: settings
+                .get("detection.slow_scan_window_sec")
+                .unwrap_or(3600),
+            expirare_cache: settings
+                .get("detection.cache_expiration_sec")
+                .unwrap_or(7200),
+            filter_actions: settings
+                .get("detection.filter_actions")
+                .ok(),
         };
 
-        let message = format!(
-            "Scan de rețea {} detectat: IP {} a accesat {} porturi unice în ultimele {} secunde",
-            alert_type, source_ip, unique_ports, window
-        );
+        info!("✅ Configurare încărcată cu succes din fișier");
+        Ok(config)
+    }
 
+    /// Default este un trait (interfață) care permite crearea valorilor implicite
+    /// Self = tipul curent (ConfigurareDetecareScanuri)
+    fn default() -> Self {
+        info!("⚠️  Folosesc configurarea implicită (default)");
+        // Self { ... } creează o nouă instanță a struct-ului
         Self {
-            alert_type,
-            source_ip,
-            unique_ports_scanned: unique_ports,
-            time_window_seconds: window,
-            detection_time: Utc::now().to_rfc3339(),
-            severity: severity.to_string(),
-            message,
+            prag_scanare_rapida: 10,      // 10+ porturi = scan rapid
+            fereastra_scanare_rapida: 60,  // în 1 minut
+            prag_scanare_lenta: 20,        // 20+ porturi = scan lent
+            fereastra_scanare_lenta: 3600, // în 1 oră (3600 secunde)
+            expirare_cache: 7200,          // păstrează date 2 ore
+            filter_actions: None,          // procesează toate acțiunile
+        }
+    }
+}
+
+/// Struct pentru configurarea rețelei (adrese IP și porturi)
+#[derive(Debug, Clone)]
+struct ConfigurareRetea {
+    adresa_ascultare: String,
+    adresa_siem: String,
+}
+
+impl ConfigurareRetea {
+    /// Încarcă configurarea rețelei din fișier
+    fn din_fisier(cale: &str) -> Result<Self> {
+        let settings = Config::builder()
+            .add_source(config::File::with_name(cale))
+            .build()?;
+
+        Ok(Self {
+            adresa_ascultare: settings
+                .get_string("network.listen_address")
+                .unwrap_or_else(|_| "0.0.0.0:5555".to_string()),
+            adresa_siem: settings
+                .get_string("network.siem_address")
+                .unwrap_or_else(|_| "127.0.0.1:514".to_string()),
+        })
+    }
+
+    /// Configurare default pentru rețea
+    fn default() -> Self {
+        Self {
+            adresa_ascultare: "0.0.0.0:5555".to_string(),
+            adresa_siem: "127.0.0.1:514".to_string(),
+        }
+    }
+}
+
+// ============================================================================
+// SECȚIUNEA 3: ACTIVITATEA UNUI IP SURSĂ
+// ============================================================================
+
+/// Struct care păstrează informații despre ce face un anumit IP
+#[derive(Debug, Clone)]
+struct ActivitateaSursei {
+    /// Vec = Vector (listă dinamică în Rust)
+    /// (u16, u64) = Tuplu cu 2 elemente: port (u16) și timestamp (u64)
+    /// u16 = unsigned 16-bit (0-65535, perfect pentru numere de porturi)
+    accesari_porturi: Vec<(u16, u64)>,
+
+    /// Ultima dată când am văzut acest IP activ
+    ultima_aparitie: u64,
+
+    /// bool = boolean (true/false)
+    /// Marchează dacă am trimis deja o alertă pentru acest IP
+    alerta_trimisa: bool,
+}
+
+impl ActivitateaSursei {
+    /// Constructor - creează o nouă instanță goală
+    fn nou() -> Self {
+        Self {
+            // Vec::new() creează un vector gol
+            accesari_porturi: Vec::new(),
+            ultima_aparitie: timestamp_curent(),
+            alerta_trimisa: false,
         }
     }
 
-    /// Trimite alerta către ArcSight SIEM (format CEF)
-    fn to_cef(&self) -> String {
+    /// Funcție care adaugă un port la lista de porturi accesate
+    /// &mut self = referință mutabilă la sine (poate modifica struct-ul)
+    fn adauga_port(&mut self, port: u16) {
+        let acum = timestamp_curent();
+        // push() adaugă un element la sfârșitul vectorului
+        self.accesari_porturi.push((port, acum));
+        self.ultima_aparitie = acum;
+    }
+
+    /// Șterge intrările vechi (cleanup)
+    /// &mut self = poate modifica struct-ul
+    /// fereastra: u64 = parametru de tip u64
+    fn curata(&mut self, fereastra: u64) {
+        // saturating_sub = scădere care nu permite overflow (nu merge sub 0)
+        let limita = timestamp_curent().saturating_sub(fereastra);
+
+        // retain() = păstrează doar elementele care îndeplinesc condiția
+        // |(_, timestamp)| = closure (funcție anonimă) cu parametrii
+        // _ = ignoră primul element al tuplului (portul)
+        // *timestamp = dereferențiere (ia valoarea din pointer)
+        self.accesari_porturi.retain(|(_, timestamp)| *timestamp > limita);
+    }
+
+    /// Numără câte porturi UNICE au fost accesate în fereastra de timp
+    /// &self = referință imutabilă (doar citește, nu modifică)
+    /// -> usize = tipul valorii returnate
+    fn porturi_unice_in_fereastra(&self, fereastra: u64) -> usize {
+        let limita = timestamp_curent().saturating_sub(fereastra);
+
+        // PROGRAMARE FUNCȚIONALĂ - înlănțuire de operații:
+        self.accesari_porturi
+            .iter()                    // 1. Iterează prin vector
+            .filter(|(_, timestamp)| *timestamp > limita)  // 2. Filtrează (păstrează doar cele noi)
+            .map(|(port, _)| port)     // 3. Transformă (ia doar portul, ignoră timestamp-ul)
+            .collect::<std::collections::HashSet<_>>()  // 4. Colectează într-un HashSet (elimină duplicate automat)
+            .len()                     // 5. Returnează dimensiunea (numărul de porturi unice)
+    }
+}
+
+// ============================================================================
+// SECȚIUNEA 4: EVENIMENT CEF (Log parsat)
+// ============================================================================
+
+/// Struct care reprezintă un eveniment de securitate parsat din log
+///
+/// #[derive(Debug, Clone, Serialize, Deserialize)] înseamnă:
+/// - Serialize: Poate fi convertit în JSON/text
+/// - Deserialize: Poate fi creat din JSON/text
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct EvenimentCef {
+    /// Option<T> = Poate fi Some(valoare) sau None (lipsă)
+    /// Este similar cu "nullable" din alte limbaje
+
+    /// #[serde(skip_serializing_if = "Option::is_none")]
+    /// = Când convertim în JSON, ignoră câmpul dacă este None
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ip_sursa: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ip_destinatie: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    port_destinatie: Option<u16>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    actiune: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    protocol: Option<String>,
+
+    timestamp: String,
+
+    // String = text alocat pe heap (poate crește dinamic)
+    raw: String,  // Log-ul original, neprelucrat
+}
+
+// ============================================================================
+// SECȚIUNEA 5: ALERTĂ DE SCAN DETECTAT
+// ============================================================================
+
+/// Struct care reprezintă o alertă când detectăm un scan
+#[derive(Debug, Serialize)]
+struct AlertaScan {
+    tip_alerta: String,              // "RAPID_SCAN" sau "SLOW_SCAN"
+    ip_sursa: String,                 // IP-ul atacatorului
+    porturi_unice_scanate: usize,    // Câte porturi a scanat
+    fereastra_timp_secunde: u64,     // În cât timp
+    timp_detectare: String,           // Când am detectat
+    severitate: String,               // "HIGH", "MEDIUM", etc.
+    mesaj: String,                    // Mesaj descriptiv
+}
+
+impl AlertaScan {
+    /// Constructor pentru o alertă nouă
+    ///
+    /// Parametri:
+    /// tip_alerta: String - tipul de scan detectat
+    /// ip_sursa: String - IP-ul atacatorului
+    /// porturi_unice: usize - câte porturi a scanat
+    /// fereastra: u64 - în câte secunde
+    ///
+    /// -> Self înseamnă că funcția returnează o instanță a struct-ului
+    fn nou(
+        tip_alerta: String,
+        ip_sursa: String,
+        porturi_unice: usize,
+        fereastra: u64,
+    ) -> Self {
+        // if/else în formă expresie (returnează o valoare)
+        let severitate = if tip_alerta == "RAPID_SCAN" {
+            "HIGH"      // Scan rapid = pericol mare
+        } else {
+            "MEDIUM"    // Scan lent = pericol mediu
+        };
+
+        // format!() = ca printf/sprintf - creează un String formatat
+        // {} = placeholder pentru a insera variabile
+        let mesaj = format!(
+            "Scan de rețea {} detectat: IP {} a accesat {} porturi unice în ultimele {} secunde",
+            tip_alerta, ip_sursa, porturi_unice, fereastra
+        );
+
+        // Creează și returnează struct-ul
+        Self {
+            tip_alerta,
+            ip_sursa,
+            porturi_unice_scanate: porturi_unice,
+            fereastra_timp_secunde: fereastra,
+            timp_detectare: Utc::now().to_rfc3339(),  // Data/ora curentă în format ISO
+            severitate: severitate.to_string(),        // Convertește &str în String
+            mesaj,
+        }
+    }
+
+    /// Convertește alerta în format CEF pentru ArcSight
+    /// &self = referință imutabilă (doar citește din struct)
+    /// -> String = returnează un String
+    fn in_format_cef(&self) -> String {
         format!(
             "CEF:0|CustomIDS|NetworkScanner|1.0|{}|{}|{}|src={} msg={} cnt={}",
-            self.alert_type,
-            self.message,
-            self.severity,
-            self.source_ip,
-            self.message.replace('|', "\\|"),
-            self.unique_ports_scanned
+            self.tip_alerta,
+            self.mesaj,
+            self.severitate,
+            self.ip_sursa,
+            // replace() înlocuiește caracterele periculoase pentru CEF
+            self.mesaj.replace('|', "\\|"),
+            self.porturi_unice_scanate
         )
     }
 }
 
-/// Parser pentru formate CEF și Raw Syslog
-struct LogParser {
-    cef_regex: Regex,
+// ============================================================================
+// SECȚIUNEA 6: PARSER DE LOG-URI
+// ============================================================================
+
+/// Struct care parsează (analizează) log-uri în diverse formate
+struct ParsorLoguri {
+    regex_cef: Regex,  // Pattern pentru CEF
 }
 
-impl LogParser {
-    fn new() -> Result<Self> {
-        // Regex pentru parsing CEF
-        let cef_regex = Regex::new(
+impl ParsorLoguri {
+    /// Constructor - creează un nou parser
+    /// Result<T> = poate returna Ok(valoare) sau Err(eroare)
+    /// Este cum gestionezi erori în Rust (în loc de try/catch)
+    fn nou() -> Result<Self> {
+        // Regex pentru a extrage partea de extensie din CEF
+        // r"..." = raw string (backslash-urile nu sunt escape)
+        let regex_cef = Regex::new(
             r"CEF:\d+\|[^|]*\|[^|]*\|[^|]*\|[^|]*\|[^|]*\|[^|]*\|(.*)"
-        )?;
-        
-        Ok(Self { cef_regex })
+        )?;  // ? = dacă e eroare, returnează eroarea imediat (early return)
+
+        Ok(Self { regex_cef })
     }
 
-    /// Parsează un log CEF sau Raw Syslog
-    fn parse(&self, log_line: &str) -> Option<CefEvent> {
+    /// Parsează un log (încearcă CEF, apoi Syslog)
+    /// &self = referință imutabilă
+    /// log_line: &str = referință la un string slice (nu deține string-ul)
+    /// -> Option<EvenimentCef> = poate returna Some(eveniment) sau None
+    fn parseaza(&self, linie_log: &str) -> Option<EvenimentCef> {
+        // if let = pattern matching condiționat
         // Încearcă să parseze ca CEF
-        if let Some(cef_event) = self.parse_cef(log_line) {
-            return Some(cef_event);
+        if let Some(eveniment_cef) = self.parseaza_cef(linie_log) {
+            return Some(eveniment_cef);  // Succes! Returnează
         }
 
-        // Fallback: încearcă să parseze ca Raw Syslog
-        self.parse_raw_syslog(log_line)
+        // Dacă CEF a eșuat, încearcă Syslog
+        self.parseaza_syslog(linie_log)
     }
 
-    /// Parsează format CEF
-    fn parse_cef(&self, log_line: &str) -> Option<CefEvent> {
-        if !log_line.starts_with("CEF:") {
-            return None;
+    /// Parsează format CEF (inclusiv cu header Syslog)
+    fn parseaza_cef(&self, linie_log: &str) -> Option<EvenimentCef> {
+        // Găsește unde începe partea CEF (poate avea header Syslog înainte)
+        let cef_start = linie_log.find("CEF:")?;
+        let linie_cef = &linie_log[cef_start..];
+
+        // Verifică dacă începe cu "CEF:"
+        if !linie_cef.starts_with("CEF:") {
+            return None;  // Nu e CEF, returnează None (lipsă)
         }
 
-        let caps = self.cef_regex.captures(log_line)?;
-        let extension = caps.get(1)?.as_str();
+        // captures() = găsește pattern-ul în text
+        // ? = dacă nu găsește, returnează None imediat
+        let capturi = self.regex_cef.captures(linie_cef)?;
 
-        let mut event = CefEvent {
-            source_ip: None,
-            dest_ip: None,
-            dest_port: None,
-            action: None,
+        // get(1) = ia primul grup capturat (extensia)
+        // as_str() = convertește în &str
+        let extensie = capturi.get(1)?.as_str();
+
+        // Creează un eveniment gol
+        let mut eveniment = EvenimentCef {
+            ip_sursa: None,
+            ip_destinatie: None,
+            port_destinatie: None,
+            actiune: None,
             protocol: None,
             timestamp: Utc::now().to_rfc3339(),
-            raw: log_line.to_string(),
+            raw: linie_log.to_string(),  // to_string() = creează un String deținut
         };
 
-        // Parsează extension (key=value pairs)
-        for pair in extension.split_whitespace() {
-            if let Some((key, value)) = pair.split_once('=') {
-                match key {
-                    "src" => event.source_ip = Some(value.to_string()),
-                    "dst" => event.dest_ip = Some(value.to_string()),
-                    "dpt" => event.dest_port = value.parse().ok(),
-                    "act" => event.action = Some(value.to_string()),
-                    "proto" => event.protocol = Some(value.to_string()),
-                    _ => {}
+        // Parsează perechile key=value din extensie
+        // split_whitespace() = împarte după spații
+        for pereche in extensie.split_whitespace() {
+            // split_once('=') = împarte în 2 la primul '='
+            if let Some((cheie, valoare)) = pereche.split_once('=') {
+                // match = switch statement puternic din Rust
+                match cheie {
+                    "src" => eveniment.ip_sursa = Some(valoare.to_string()),
+                    "dst" => eveniment.ip_destinatie = Some(valoare.to_string()),
+                    "dpt" => eveniment.port_destinatie = valoare.parse().ok(),  // parse() convertește string în număr
+                    "act" => eveniment.actiune = Some(valoare.to_string()),
+                    "proto" => eveniment.protocol = Some(valoare.to_string()),
+                    _ => {}  // _ = ignoră alte chei necunoscute
                 }
             }
         }
 
-        Some(event)
+        Some(eveniment)  // Returnează evenimentul parsat
     }
 
-    /// Parsează Raw Syslog (format simplificat)
-    fn parse_raw_syslog(&self, log_line: &str) -> Option<CefEvent> {
-        // Exemplu simplificat: caută pattern-uri comune în syslog
-        // Format așteptat: "... src=X.X.X.X dst=Y.Y.Y.Y dport=ZZZZ action=DENY ..."
-        
-        let src_regex = Regex::new(r"(?:src=|source=|SRC=)(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})").ok()?;
-        let dst_regex = Regex::new(r"(?:dst=|dest=|destination=|DST=)(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})").ok()?;
-        let dport_regex = Regex::new(r"(?:dport=|dpt=|DPT=)(\d+)").ok()?;
-        let action_regex = Regex::new(r"(?:action=|ACT=|act=)(\w+)").ok()?;
+    /// Parsează format Raw Syslog (simplificat)
+    fn parseaza_syslog(&self, linie_log: &str) -> Option<EvenimentCef> {
+        // Creează pattern-uri regex pentru diferite formate
+        // (?:...) = grup non-capturat (alternativă)
+        // \d{1,3} = cifră de 1-3 ori (pentru adrese IP)
+        let regex_sursa = Regex::new(r"(?:src=|source=|SRC=)(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})").ok()?;
+        let regex_dest = Regex::new(r"(?:dst=|dest=|destination=|DST=)(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})").ok()?;
+        let regex_port_dest = Regex::new(r"(?:dport=|dpt=|DPT=)(\d+)").ok()?;
+        let regex_actiune = Regex::new(r"(?:action=|ACT=|act=)(\w+)").ok()?;
 
-        let source_ip = src_regex.captures(log_line)
+        // Caută IP-ul sursă în text
+        // and_then() = aplică funcția dacă valoarea nu e None
+        // map() = transformă valoarea
+        let ip_sursa = regex_sursa.captures(linie_log)
+            .and_then(|c| c.get(1))  // Ia primul grup capturat
+            .map(|m| m.as_str().to_string());  // Convertește în String
+
+        let ip_dest = regex_dest.captures(linie_log)
             .and_then(|c| c.get(1))
             .map(|m| m.as_str().to_string());
 
-        let dest_ip = dst_regex.captures(log_line)
+        let port_dest = regex_port_dest.captures(linie_log)
+            .and_then(|c| c.get(1))
+            .and_then(|m| m.as_str().parse().ok());  // parse() și ok() pentru conversie sigură
+
+        let actiune = regex_actiune.captures(linie_log)
             .and_then(|c| c.get(1))
             .map(|m| m.as_str().to_string());
 
-        let dest_port = dport_regex.captures(log_line)
-            .and_then(|c| c.get(1))
-            .and_then(|m| m.as_str().parse().ok());
-
-        let action = action_regex.captures(log_line)
-            .and_then(|c| c.get(1))
-            .map(|m| m.as_str().to_string());
-
-        // Necesită cel puțin source IP și destination port pentru detectare
-        if source_ip.is_some() && dest_port.is_some() {
-            Some(CefEvent {
-                source_ip,
-                dest_ip,
-                dest_port,
-                action,
+        // Necesită cel puțin IP sursă și port destinație
+        // is_some() = verifică dacă Option are o valoare (nu e None)
+        if ip_sursa.is_some() && port_dest.is_some() {
+            Some(EvenimentCef {
+                ip_sursa,
+                ip_destinatie: ip_dest,
+                port_destinatie: port_dest,
+                actiune,
                 protocol: None,
                 timestamp: Utc::now().to_rfc3339(),
-                raw: log_line.to_string(),
+                raw: linie_log.to_string(),
             })
         } else {
-            None
+            None  // Nu avem destule date
         }
     }
 }
 
-/// Detector de scan-uri de rețea
-struct ScanDetector {
-    config: ScanDetectionConfig,
-    activity_map: Arc<DashMap<String, SourceActivity>>,
-    parser: LogParser,
+// ============================================================================
+// SECȚIUNEA 7: DETECTOR DE SCAN-URI (Motorul principal)
+// ============================================================================
+
+/// Struct-ul principal care detectează scan-urile
+struct DetectorScanuri {
+    configurare: ConfigurareDetecareScanuri,
+
+    /// Arc = Atomic Reference Counted
+    /// Pointer thread-safe care numără referințele
+    /// DashMap = HashMap thread-safe (poate fi accesat din mai multe thread-uri)
+    harta_activitati: Arc<DashMap<String, ActivitateaSursei>>,
+
+    parsor: ParsorLoguri,
 }
 
-impl ScanDetector {
-    fn new(config: ScanDetectionConfig) -> Result<Self> {
+impl DetectorScanuri {
+    /// Constructor
+    fn nou(configurare: ConfigurareDetecareScanuri) -> Result<Self> {
         Ok(Self {
-            config,
-            activity_map: Arc::new(DashMap::new()),
-            parser: LogParser::new()?,
+            configurare,
+            harta_activitati: Arc::new(DashMap::new()),  // Arc::new() face pointer-ul thread-safe
+            parsor: ParsorLoguri::nou()?,
         })
     }
 
+    /// Verifică dacă acțiunea trebuie procesată (conform filtrelor din config)
+    fn trebuie_procesat(&self, actiune: &Option<String>) -> bool {
+        // Dacă nu avem filtru, procesăm totul
+        let Some(ref filtru) = self.configurare.filter_actions else {
+            return true;
+        };
+
+        // Dacă avem filtru, verificăm dacă acțiunea e în listă
+        if let Some(ref act) = actiune {
+            filtru.iter().any(|f| f.eq_ignore_ascii_case(act))
+        } else {
+            // Dacă log-ul nu are acțiune, nu îl procesăm dacă avem filtru activ
+            false
+        }
+    }
+
     /// Procesează un eveniment de log
-    async fn process_event(&self, log_line: &str) -> Option<ScanAlert> {
-        let event = self.parser.parse(log_line)?;
+    /// async = funcție asincronă (poate aștepta fără să blocheze thread-ul)
+    /// &self = referință imutabilă
+    async fn proceseaza_eveniment(&self, linie_log: &str) -> Option<AlertaScan> {
+        // Parsează log-ul
+        let eveniment = self.parsor.parseaza(linie_log)?;
 
-        // Ignoră evenimente fără source IP sau destination port
-        let source_ip = event.source_ip.as_ref()?;
-        let dest_port = event.dest_port?;
+        // Verifică filtrul de acțiuni (dacă există)
+        if !self.trebuie_procesat(&eveniment.actiune) {
+            return None;
+        }
 
-        // Opțional: filtrare după action (doar DENY/BLOCK)
-        // Decomentează dacă vrei să analizezi doar trafic blocat
-        // if let Some(action) = &event.action {
-        //     if !action.eq_ignore_ascii_case("deny") && !action.eq_ignore_ascii_case("block") {
-        //         return None;
-        //     }
-        // }
+        // Extrage IP sursă și port destinație
+        // as_ref() = convertește &Option<String> în Option<&String>
+        let ip_sursa = eveniment.ip_sursa.as_ref()?;
+        let port_dest = eveniment.port_destinatie?;
 
-        // Actualizează activitatea sursei
-        let mut activity = self.activity_map
-            .entry(source_ip.clone())
-            .or_insert_with(SourceActivity::new);
+        // Actualizează sau creează intrarea pentru acest IP
+        // entry() = obține acces la o cheie din HashMap
+        // or_insert_with() = inserează o valoare nouă dacă cheia nu există
+        let mut activitate = self.harta_activitati
+            .entry(ip_sursa.clone())  // clone() = creează o copie a String-ului
+            .or_insert_with(ActivitateaSursei::nou);  // Closure fără parametri
 
-        activity.add_port(dest_port);
-        
-        // Cleanup intrări vechi
-        activity.cleanup(self.config.slow_scan_window);
+        activitate.adauga_port(port_dest);
 
-        // Verifică scan rapid
-        let rapid_ports = activity.unique_ports_in_window(self.config.rapid_scan_window);
-        if rapid_ports >= self.config.rapid_scan_threshold && !activity.alert_sent {
-            activity.alert_sent = true;
-            return Some(ScanAlert::new(
+        // Curăță intrările vechi
+        activitate.curata(self.configurare.fereastra_scanare_lenta);
+
+        // Verifică dacă avem scan rapid
+        let porturi_rapide = activitate.porturi_unice_in_fereastra(
+            self.configurare.fereastra_scanare_rapida
+        );
+
+        // >= = mai mare sau egal
+        // && = operatorul logic AND
+        // ! = negare (NOT)
+        if porturi_rapide >= self.configurare.prag_scanare_rapida && !activitate.alerta_trimisa {
+            activitate.alerta_trimisa = true;  // Marchează că am trimis alerta
+            return Some(AlertaScan::nou(
                 "RAPID_SCAN".to_string(),
-                source_ip.clone(),
-                rapid_ports,
-                self.config.rapid_scan_window,
+                ip_sursa.clone(),
+                porturi_rapide,
+                self.configurare.fereastra_scanare_rapida,
             ));
         }
 
-        // Verifică scan lent
-        let slow_ports = activity.unique_ports_in_window(self.config.slow_scan_window);
-        if slow_ports >= self.config.slow_scan_threshold && !activity.alert_sent {
-            activity.alert_sent = true;
-            return Some(ScanAlert::new(
+        // Verifică dacă avem scan lent
+        let porturi_lente = activitate.porturi_unice_in_fereastra(
+            self.configurare.fereastra_scanare_lenta
+        );
+
+        if porturi_lente >= self.configurare.prag_scanare_lenta && !activitate.alerta_trimisa {
+            activitate.alerta_trimisa = true;
+            return Some(AlertaScan::nou(
                 "SLOW_SCAN".to_string(),
-                source_ip.clone(),
-                slow_ports,
-                self.config.slow_scan_window,
+                ip_sursa.clone(),
+                porturi_lente,
+                self.configurare.fereastra_scanare_lenta,
             ));
         }
 
-        None
+        None  // Nu am detectat scan
     }
 
-    /// Task de curățare periodică a cache-ului
-    async fn cleanup_task(activity_map: Arc<DashMap<String, SourceActivity>>, cache_expiry: u64) {
-        let mut interval = time::interval(Duration::from_secs(300)); // Verifică la fiecare 5 minute
-        
+    /// Task (sarcină) de curățare periodică a cache-ului
+    /// async fn = funcție asincronă
+    /// Rulează în background și șterge IP-urile vechi
+    async fn task_curatare(
+        harta_activitati: Arc<DashMap<String, ActivitateaSursei>>,
+        expirare_cache: u64
+    ) {
+        // interval() = creează un timer care "tick"-ează periodic
+        // Duration::from_secs(300) = 300 secunde = 5 minute
+        let mut interval = time::interval(Duration::from_secs(300));
+
+        // loop = buclă infinită (rulează mereu)
         loop {
-            interval.tick().await;
-            
-            let cutoff = current_timestamp().saturating_sub(cache_expiry);
-            activity_map.retain(|_, activity| activity.last_seen > cutoff);
-            
-            info!("Cleanup: {} IP-uri active în cache", activity_map.len());
+            // .await = așteaptă asincron (fără să blocheze thread-ul)
+            interval.tick().await;  // Așteaptă următorul tick (5 minute)
+
+            let limita = timestamp_curent().saturating_sub(expirare_cache);
+
+            // retain() = păstrează doar elementele care îndeplinesc condiția
+            // |_, activitate| = closure cu 2 parametri (ignorăm primul)
+            harta_activitati.retain(|_, activitate| activitate.ultima_aparitie > limita);
+
+            // info!() = macro pentru logging (ca println! dar pentru log-uri)
+            info!("🧹 Curățare: {} IP-uri active în cache", harta_activitati.len());
         }
     }
 }
 
-/// Obține timestamp-ul curent în secunde
-fn current_timestamp() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
+// ============================================================================
+// SECȚIUNEA 8: FUNCȚII UTILITARE
+// ============================================================================
+
+/// Obține timestamp-ul curent în secunde de la UNIX EPOCH (1 ian 1970)
+fn timestamp_curent() -> u64 {
+    SystemTime::now()  // Ora curentă
+        .duration_since(UNIX_EPOCH)  // Diferența față de 1970
+        .unwrap()  // unwrap() = extrage valoarea sau panică (oprește programul) dacă e eroare
+        .as_secs()  // Convertește în secunde
 }
 
-/// Trimite alertă către ArcSight SIEM
-async fn send_alert_to_siem(alert: &ScanAlert, siem_addr: &str) -> Result<()> {
+/// Trimite alertă către ArcSight SIEM prin UDP
+/// async = funcție asincronă
+async fn trimite_alerta_catre_siem(alerta: &AlertaScan, adresa_siem: &str) -> Result<()> {
+    // Creează un socket UDP
+    // "0.0.0.0:0" = bind pe orice interfață, port aleatoriu
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
-    let cef_message = alert.to_cef();
-    
-    socket.send_to(cef_message.as_bytes(), siem_addr).await?;
-    
-    info!("Alertă trimisă către SIEM ({}): {}", siem_addr, cef_message);
+
+    let mesaj_cef = alerta.in_format_cef();
+
+    // Trimite pachetul UDP
+    // as_bytes() = convertește String în &[u8] (array de bytes)
+    socket.send_to(mesaj_cef.as_bytes(), adresa_siem).await?;
+
+    info!("📤 Alertă trimisă către SIEM ({}): {}", adresa_siem, mesaj_cef);
+
+    // Ok(()) = returnează succes fără valoare
     Ok(())
 }
 
+// ============================================================================
+// SECȚIUNEA 9: FUNCȚIA MAIN (Punctul de intrare)
+// ============================================================================
+
+/// Funcția principală a programului
+///
+/// #[tokio::main] = macro care transformă main() într-un runtime asincron Tokio
+/// Fără acest macro, nu am putea folosi async/await
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Inițializare logging
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .init();
+    // PASUL 1: Inițializare logging
+    // Setează nivelul de logging din variabila de mediu RUST_LOG
+    // Dacă nu există, folosește "info" ca default
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("info")
+    ).init();
 
-    info!("🚀 Starting Intrusion Detection Scanner");
+    info!("🚀 Pornire Scanner de Detectare Intruziuni v2.0");
+    info!("📝 Cu suport pentru configurare din fișier TOML");
 
-    // Configurare
-    let listen_addr = "0.0.0.0:5555"; // Portul pe care ascultă programul
-    let siem_addr = "127.0.0.1:514"; // Adresa ArcSight SIEM pentru alerte
-    
-    let config = ScanDetectionConfig::default();
-    info!("Configurare: {:?}", config);
+    // PASUL 2: Încărcare configurare din fișier (sau default dacă nu există)
+    let configurare = ConfigurareDetecareScanuri::din_fisier("config")
+        .unwrap_or_else(|e| {
+            warn!("⚠️  Nu pot încărca config.toml: {}. Folosesc configurare default.", e);
+            ConfigurareDetecareScanuri::default()
+        });
 
-    // Inițializare detector
-    let detector = Arc::new(ScanDetector::new(config.clone())?);
+    info!("⚙️  Configurare detectare: {:?}", configurare);
 
-    // Pornire task de cleanup
-    let cleanup_map = detector.activity_map.clone();
+    // Afișare informații despre filtrele active
+    if let Some(ref filtru) = configurare.filter_actions {
+        info!("🔍 Filtru acțiuni activ: {:?}", filtru);
+    } else {
+        info!("🔍 Fără filtru acțiuni - procesez toate log-urile");
+    }
+
+    // Încărcare configurare rețea
+    let config_retea = ConfigurareRetea::din_fisier("config")
+        .unwrap_or_else(|e| {
+            warn!("⚠️  Nu pot încărca configurarea rețelei: {}. Folosesc valori default.", e);
+            ConfigurareRetea::default()
+        });
+
+    info!("🌐 Configurare rețea: adresa_ascultare={}, adresa_siem={}",
+          config_retea.adresa_ascultare, config_retea.adresa_siem);
+
+    // PASUL 3: Inițializare detector
+    // Arc::new() = face un pointer thread-safe (poate fi partajat între thread-uri)
+    let detector = Arc::new(DetectorScanuri::nou(configurare.clone())?);
+
+    // PASUL 4: Pornire task de curățare în background
+    // clone() = creează o copie a pointer-ului Arc (incrementează contorul de referințe)
+    let harta_curatare = detector.harta_activitati.clone();
+
+    // tokio::spawn() = lansează un task asincron în background
+    // async move = closure asincron care "preia" (move) ownership-ul variabilelor
     tokio::spawn(async move {
-        ScanDetector::cleanup_task(cleanup_map, config.cache_expiry).await;
+        DetectorScanuri::task_curatare(harta_curatare, configurare.expirare_cache).await;
     });
 
-    // Bind UDP socket
-    let socket = UdpSocket::bind(listen_addr).await?;
-    info!("📡 Listening on UDP {}", listen_addr);
-    info!("🎯 Alerte vor fi trimise către SIEM: {}", siem_addr);
+    // PASUL 5: Deschide socket UDP
+    let socket = UdpSocket::bind(&config_retea.adresa_ascultare).await?;
+    info!("📡 Ascult pe UDP {}", config_retea.adresa_ascultare);
+    info!("🎯 Alertele vor fi trimise către SIEM: {}", config_retea.adresa_siem);
+    info!("✅ Sistemul este operațional și gata să proceseze log-uri");
+    info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
-    let mut buf = vec![0u8; 65535];
+    // PASUL 6: Buffer pentru primirea pachetelor
+    // vec![0u8; 65535] = creează un vector de 65535 bytes inițializați cu 0
+    // 65535 = dimensiunea maximă a unui pachet UDP
+    let mut buffer = vec![0u8; 65535];
 
+    // PASUL 7: Buclă principală - primește și procesează pachete
     loop {
-        match socket.recv_from(&mut buf).await {
-            Ok((len, _addr)) => {
-                let log_line = String::from_utf8_lossy(&buf[..len]);
-                
-                // Procesează evenimentul
-                let detector_clone = detector.clone();
-                let log_line_owned = log_line.to_string();
-                let siem_addr_owned = siem_addr.to_string();
-                
+        // match = switch puternic pentru pattern matching
+        // recv_from() = primește date UDP și adresa sursă
+        match socket.recv_from(&mut buffer).await {
+            // Ok((len, _addr)) = succes, primim lungimea și adresa (ignorăm adresa cu _)
+            Ok((lungime, _adresa)) => {
+                // Convertește bytes în text (UTF-8)
+                // from_utf8_lossy() = convertește, înlocuind caracterele invalide cu �
+                // &buffer[..lungime] = slice din buffer, de la 0 la lungime
+                let linie_log = String::from_utf8_lossy(&buffer[..lungime]);
+
+                // Clone referințele pentru a le muta în task-ul async
+                let detector_clonat = detector.clone();
+                let linie_log_detinuta = linie_log.to_string();  // Creează String deținut
+                let adresa_siem_detinuta = config_retea.adresa_siem.clone();
+
+                // Lansează un task asincron pentru a procesa evenimentul
+                // Astfel, nu blocăm primirea următoarelor pachete
                 tokio::spawn(async move {
-                    if let Some(alert) = detector_clone.process_event(&log_line_owned).await {
-                        warn!("⚠️  SCAN DETECTAT: {}", alert.message);
-                        
-                        // Trimite alertă către SIEM
-                        if let Err(e) = send_alert_to_siem(&alert, &siem_addr_owned).await {
-                            error!("Eroare la trimiterea alertei: {}", e);
+                    // if let Some() = pattern matching pentru Option
+                    if let Some(alerta) = detector_clonat.proceseaza_eveniment(&linie_log_detinuta).await {
+                        // warn!() = logging pentru warning
+                        warn!("⚠️  SCAN DETECTAT: {}", alerta.mesaj);
+
+                        // Trimite alerta către SIEM
+                        // if let Err(e) = verifică dacă Result este eroare
+                        if let Err(e) = trimite_alerta_catre_siem(&alerta, &adresa_siem_detinuta).await {
+                            // error!() = logging pentru erori
+                            error!("❌ Eroare la trimiterea alertei: {}", e);
                         }
                     }
                 });
             }
+            // Err(e) = eroare la primirea pachetului
             Err(e) => {
-                error!("Eroare la primirea pachetului UDP: {}", e);
+                error!("❌ Eroare la primirea pachetului UDP: {}", e);
             }
         }
     }
+
+    // Nota: Bucla infinită nu se termină niciodată în mod normal
+    // Programul se oprește doar dacă primește signal (Ctrl+C) sau eroare critică
 }
+
+// ============================================================================
+// SFATURI PENTRU ÎNVĂȚARE RUST
+// ============================================================================
+//
+// 1. OWNERSHIP (Proprietate):
+//    - Fiecare valoare are un singur "owner" (proprietar)
+//    - Când owner-ul iese din scope, valoarea e distrusă (drop)
+//    - Nu există garbage collector - memoria e gestionată automat și sigur
+//
+// 2. BORROWING (Împrumut):
+//    - &T = referință imutabilă (read-only)
+//    - &mut T = referință mutabilă (read-write)
+//    - Poți avea multe & sau o singură &mut la un moment dat
+//
+// 3. LIFETIME (Durata de viață):
+//    - Determină cât timp o referință este validă
+//    - Compilatorul verifică automat în majoritatea cazurilor
+//
+// 4. OPTION & RESULT:
+//    - Option<T> = Some(valoare) sau None (lipsa valorii)
+//    - Result<T, E> = Ok(valoare) sau Err(eroare)
+//    - Înlocuiesc null/undefined și excepțiile din alte limbaje
+//
+// 5. PATTERN MATCHING:
+//    - match, if let, while let
+//    - Foarte puternic pentru destructurare și ramificație logică
+//
+// 6. ASYNC/AWAIT:
+//    - Cod asincron fără callback hell
+//    - Tokio = runtime pentru executare asincronă
+//
+// 7. TRAITS:
+//    - Ca interfețele din alte limbaje
+//    - Debug, Clone, Default, etc. sunt traits
+//
+// 8. CONFIGURARE DIN FIȘIERE:
+//    - Folosim biblioteca `config` pentru citirea TOML
+//    - Deserializare automată cu Serde
+//    - Fallback la valori default dacă fișierul lipsește
+//
+// RESURSE DE ÎNVĂȚARE:
+// - "The Rust Programming Language" (The Book) - carte oficială gratuită
+// - Rust by Example - exemple practice
+// - Rustlings - exerciții interactive
+//
+// ============================================================================
