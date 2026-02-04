@@ -21,7 +21,7 @@ Dacă ești **începător în Rust** și vrei să înveți:
    - Resurse de învățare
    - Exerciții practice
 
-2. **[src/main_educational_ro.rs](src/main_educational_ro.rs)** - Cod cu comentarii educaționale
+2. **[src/main_educational_ro.rs](../src/main_educational_ro.rs)** - Cod cu comentarii educaționale
    - Fiecare linie explicată în română
    - Explicații despre conceptele Rust folosite
    - Exemple și sfaturi
@@ -36,7 +36,7 @@ Dacă ești **începător în Rust** și vrei să înveți:
 
 Pentru înțelegerea completă a proiectului:
 
-1. **[README.md](README.md)** - Documentație completă
+1. **[README.md](../README.md)** - Documentație completă
    - Arhitectură
    - Toate funcționalitățile
    - API și usage
@@ -57,9 +57,9 @@ Pentru înțelegerea completă a proiectului:
 
 ## 🔧 Fișiere de Configurare
 
-1. **[config.example.toml](config.example.toml)** - Template de configurare
-2. **[ids-scanner.service](ids-scanner.service)** - Fișier systemd service
-3. **[test_scanner.sh](test_scanner.sh)** - Script de testare automată
+1. **[config.example.toml](../src/config.example.toml)** - Template de configurare
+2. **[ids-scanner.service](../service/ids-scanner.service)** - Fișier systemd service
+3. **[test_scanner.sh](../src/test_scanner.sh)** - Script de testare automată
 
 ## 📁 Structura Proiectului
 
@@ -130,13 +130,13 @@ ids-scanner/
 
 - **Pornesc rapid scanner-ul** → [QUICKSTART.md](QUICKSTART.md)
 - **Învăț Rust de la zero** → [INVATARE_RUST.md](INVATARE_RUST.md)
-- **Înțeleg codul pas cu pas** → [src/main_educational_ro.rs](src/main_educational_ro.rs)
+- **Înțeleg codul pas cu pas** → [src/main_educational_ro.rs](../src/main_educational_ro.rs)
 - **Fac modificări practice** → [EXEMPLE_PRACTICE.md](EXEMPLE_PRACTICE.md)
 - **Deployment în producție** → [DEPLOYMENT.md](DEPLOYMENT.md)
 - **Înțeleg ce detectează** → [EXAMPLES.md](EXAMPLES.md) (Secțiunea Scenarii)
-- **Configurez ArcSight** → [README.md](README.md#configurare-arcsight-logger)
-- **Troubleshooting** → [README.md](README.md#troubleshooting)
-- **Testez funcționalitatea** → [test_scanner.sh](test_scanner.sh)
+- **Configurez ArcSight** → [README.md](../README.md#configurare-arcsight-logger)
+- **Troubleshooting** → [README.md](../README.md#troubleshooting)
+- **Testez funcționalitatea** → [test_scanner.sh](../src/test_scanner.sh)
 
 ## ❓ Întrebări Frecvente
 
@@ -160,12 +160,12 @@ R: [EXAMPLES.md - Secțiunea Formate Suportate](EXAMPLES.md#-formate-suportate)
 R: [EXEMPLE_PRACTICE.md - Secțiunea 2.1](EXEMPLE_PRACTICE.md#21-implementează-whitelist-de-ip-uri)
 
 **Î: Scanner-ul nu primește log-uri de la ArcSight**
-R: [README.md - Troubleshooting](README.md#troubleshooting)
+R: [README.md - Troubleshooting](../README.md#troubleshooting)
 
 ## 📞 Suport
 
 Pentru probleme:
-1. Verifică secțiunea **Troubleshooting** din [README.md](README.md#troubleshooting)
+1. Verifică secțiunea **Troubleshooting** din [README.md](../README.md#troubleshooting)
 2. Rulează cu debug logging: `RUST_LOG=debug cargo run`
 3. Testează cu script-ul: `./test_scanner.sh`
 4. Verifică log-urile: `sudo journalctl -u ids-scanner -f`
